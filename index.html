@@ -107,6 +107,9 @@
     .logo-gv{height:30px} .logo-abf{height:42px}
     .ruleband{flex-direction:column;gap:8px;font-size:13px}
   }
+  .cand{display:flex;justify-content:space-between;align-items:center;gap:12px;
+    padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}
+  .cand button{padding:6px 12px;font-size:12.5px}
   @media print{
     @page{size:A4;margin:0}
     body{background:var(--paper) !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
@@ -154,7 +157,7 @@
     <button class="ghost" onclick="window.print()">导出 PDF</button>
   </div>
   <div class="chips" id="chips"></div>
-  <div class="hint">支持中文关键词（城市 / 行业词 / 品牌）、英文全称或片段、CCID。查不到的，一律按兜底档 73.3% 处理。</div>
+  <div class="hint">英文需<b>至少 17 个字符</b>（或输入完整公司名 / CCID）才判定；少于 17 个字符只给提示、不下结论。中文可输入品牌或公司名。未列名者一律按 DSN 349 兜底 73.3%。</div>
 </div>
 
 <div class="card" id="result"></div>
@@ -504,13 +507,20 @@ function buildFilters(){
 }
 
 function buildChips(){
-  const samples = ["兴发","Foshan AMJ","博路德","CJM7696446H","Zhuhai Yipeng","浩天中佳"];
+  const samples = [
+    ['兴发', 'Guangdong Xingfa Aluminium Co., Ltd'],
+    ['AMJ', 'Foshan AMJ Windows and Doors Co., Ltd'],
+    ['博路德', 'Broad Windows and Doors and Curtain Wall System Co., Ltd'],
+    ['CCID', 'CJM7696446H'],
+    ['翼鹏', 'Zhuhai Yipeng Technology Co., Ltd'],
+    ['浩天中佳', 'FOSHAN HAOTIAN ZHONGJIA TECHNOLOGY CO LTD']
+  ];
   document.getElementById("chips").innerHTML = samples.map(function(s){
-    return '<span class="chip" onclick="quick(this)">' + s + '</span>';
+    return '<span class="chip" data-q="' + s[1].replace(/"/g, '&quot;') + '" onclick="quick(this)">' + s[0] + '</span>';
   }).join("");
 }
 function quick(el){
-  document.getElementById("q").value = el.textContent;
+  document.getElementById("q").value = el.getAttribute('data-q');
   doSearch();
 }
 
@@ -558,6 +568,212 @@ buildChips(); buildFilters(); renderTable(); calc();
 document.getElementById("q").addEventListener("keydown", function(e){
   if(e.key === "Enter") doSearch();
 });
+</script>
+<script>
+(function(){
+  function lcs(a, b){
+    if(!a || !b) return 0;
+    var n = b.length, prev = new Array(n+1), cur, best = 0, i, j;
+    for(j=0;j<=n;j++) prev[j]=0;
+    for(i=1;i<=a.length;i++){
+      cur = new Array(n+1); cur[0]=0;
+      for(j=1;j<=n;j++){
+        if(a.charAt(i-1)===b.charAt(j-1)){ cur[j]=prev[j-1]+1; if(cur[j]>best) best=cur[j]; }
+        else cur[j]=0;
+      }
+      prev=cur;
+    }
+    return best;
+  }
+  var MIN_SPAN = 17;
+  var GENERIC = {};
+  ['windows and doors','window and door','curtain wall','building materials','aluminium',
+   'technology','engineering','decoration','import export','home furnishing','building hardware',
+   'window and door systems','door','window','glass','hardware','industry','industrial',
+   'trading','group','holdings','system','smart','energy saving','shading','metal','products',
+   'manufacture','materials','building','household','home'].forEach(function(k){ GENERIC[k] = 1; });
+
+  function ev(e, qn){
+    var L = lcs(qn, e.n);
+    var exact = e.n === qn;
+    var maxlen = Math.max(qn.length, e.n.length);
+    var near = L >= 8 && L >= 0.8*maxlen;
+    return {e: e, L: L, ok: exact || L >= MIN_SPAN || near};
+  }
+
+  function cnSearch(raw){
+    var qn = norm(raw);
+    var aliasHits = qn.length < 3 ? [] : ENTRIES.filter(function(e){
+      return e.alias.some(function(a){ return a && a.length >= 3 && (a.indexOf(qn) > -1 || qn.indexOf(a) > -1); });
+    });
+    if(aliasHits.length === 1) return {status:'ok', hits:[{e:aliasHits[0], L:99}], raw:raw};
+    if(aliasHits.length > 1) return {status:'ambiguous', hits:aliasHits.map(function(e){return {e:e, L:99};}).slice(0,8), raw:raw};
+    var tr = translateCN(raw);
+    if(!tr.tokens.length) return {status:'insufficient', cn:true, raw:raw, note:'未识别出中文关键词，可改用英文名或 CCID', near:[]};
+    var rare = tr.tokens.filter(function(t){ return !GENERIC[t] && (DF[t] || 0) <= 3 && t.length >= 4; });
+    if(!rare.length) return {status:'insufficient', cn:true, raw:raw, note:'中文词偏宽泛（城市或行业词），请补充品牌名或完整公司名', near:[]};
+    var cands = ENTRIES.filter(function(e){
+      return rare.every(function(t){ return e.n.indexOf(t) > -1; });
+    });
+    if(cands.length === 1) return {status:'ok', hits:[{e:cands[0], L:99}], raw:raw};
+    if(cands.length > 1) return {status:'ambiguous', hits:cands.map(function(e){return {e:e, L:99};}).slice(0,8), raw:raw};
+    return {status:'none', raw:raw, info:'中文关键词已识别，但名单中没有对应公司', near:[]};
+  }
+
+  window.search = function(q){
+    var raw = (q || '').trim();
+    if(!raw) return {status:'empty'};
+    var cc = raw.toUpperCase().replace(/[\s\-]/g, '');
+    if(/^[A-Z]{3}\d{7}[A-Z]$/.test(cc)){
+      for(var i=0;i<ENTRIES.length;i++){
+        if((ENTRIES[i].ccid || '').toUpperCase() === cc) return {status:'ok', hits:[{e:ENTRIES[i], L:99}], raw:raw};
+      }
+      return {status:'none', raw:raw, info:'该 CCID 不在名单中（既非列名出口商，也非残余出口商）', near:[]};
+    }
+    if(CJK.test(raw)) return cnSearch(raw);
+    var qn = norm(raw);
+    if(qn.length < 6) return {status:'insufficient', raw:raw, need:MIN_SPAN, got:qn.length, near:[]};
+    var scored = ENTRIES.map(function(e){ return ev(e, qn); });
+    var ok = scored.filter(function(x){ return x.ok; }).sort(function(a,b){ return b.L - a.L; });
+    var near = scored.filter(function(x){ return !x.ok && x.L >= 8; })
+                    .sort(function(a,b){ return b.L - a.L; }).slice(0, 5);
+    if(ok.length === 0){
+      if(qn.length < MIN_SPAN) return {status:'insufficient', raw:raw, need:MIN_SPAN, got:qn.length, near:near};
+      return {status:'none', raw:raw, near:near};
+    }
+    if(ok.length > 1 && (ok[0].L - ok[1].L) < 3) return {status:'ambiguous', hits:ok.slice(0,8), raw:raw};
+    return {status:'ok', hits:ok, raw:raw};
+  };
+
+  function reasonText(best, L){
+    if(best.dsn === '340') return '公告认定其出口未构成倾销（倾销幅度 -47.4%），补贴幅度亦可忽略，因此豁免。报关用豁免类型 Supplier（DTX = SUPPLIER）。';
+    if(best.cat === 'named') return '在 TRN 2026/147 表 2 中单独列名，按该出口商自身核定的倾销幅度计征。';
+    if(best.cat === 'resid') return '在残余出口商名单中（应诉但未被单独抽样），统一按 24.4% 计征。';
+    return '未列名，按兜底档计征。';
+  }
+
+  function okCard(hit){
+    var best = hit.e, cat = best.cat || 'other';
+    var rateCls = best.rate === 0 ? 'safe' : (best.rate >= 60 ? 'high' : '');
+    var dsa = best.rate === 0 ? 0 : (best.dsn === '349' ? 70.4 : best.rate);
+    var csa = best.dsn === '349' ? 2.9 : 0;
+    var check = hit.L >= 99 ? '<b>校验：</b>CCID 或完整名称精确命中。'
+      : '<b>校验：</b>输入与登记名称连续匹配 <b>' + hit.L + '</b> 个字符（判定门槛 ' + MIN_SPAN + '），判定通过。';
+    return '<h2>查询结果 / Result</h2>' +
+      '<div class="cat ' + cat + '">' + (CAT_LABEL[cat] || '') + '</div>' +
+      '<div class="rate-hero">' +
+        '<div class="rate-num ' + rateCls + '">' + fmtRate(best.rate) + '</div>' +
+        '<div class="rate-meta">DSA ' + (dsa ? dsa + '%' : '—') + ' &nbsp;·&nbsp; CSA ' + (csa ? csa + '%' : '—') +
+        '<br>DSN <b>' + best.dsn + '</b> &nbsp;·&nbsp; 计税基数 DXP（FOB, cash）</div>' +
+      '</div>' +
+      '<div class="kv">' +
+        '<div><span>出口商 Exporter</span><b>' + escapeHtml(best.name) + '</b></div>' +
+        '<div><span>CCID</span><b class="mono">' + escapeHtml(best.ccid || '—') + '</b></div>' +
+        '<div><span>DSN</span><b>' + best.dsn + '</b></div>' +
+        '<div><span>有效税率</span><b>' + fmtRate(best.rate) + '</b></div>' +
+      '</div>' +
+      '<div class="note">' + check + '</div>' +
+      '<div class="note"><b>依据：</b>' + reasonText(best) + '</div>' +
+      '<div class="note"><b>报关怎么做：</b>ICS 预申报填 DSN <b>' + best.dsn + '</b> 与 DXP；向 ABF NTIS 申请 Security ID，' +
+        '附预申报截图、发票、箱单、运单和保证金计算表；可提交 Form 1485 承诺书。</div>';
+  }
+
+  function ambCard(res){
+    var rows = res.hits.map(function(h, i){
+      return '<div class="cand"><span>' + escapeHtml(h.e.name) + ' <span class="mono">' + escapeHtml(h.e.ccid || '') + '</span></span>' +
+        '<button class="ghost" onclick="pickIdx(' + i + ')">选这个</button></div>';
+    }).join('');
+    return '<h2>查询结果 / Result</h2>' +
+      '<div class="cat other">需确认 / Ambiguous</div>' +
+      '<div style="font-size:15px;line-height:1.7;margin:6px 0 10px">' +
+        '「' + escapeHtml(res.raw) + '」匹配到 ' + res.hits.length + ' 家，无法唯一确定，<b>请先选定再报关</b>。</div>' + rows;
+  }
+
+  function insuffCard(res){
+    var nearRows = (res.near || []).map(function(h, i){
+      return '<div class="cand"><span>' + escapeHtml(h.e.name) + ' <span class="mono">' + escapeHtml(h.e.ccid || '') + '</span> ' +
+        '<i style="font-style:normal;color:#8B7B5E;font-size:11px">未确认</i></span>' +
+        '<button class="ghost" onclick="fillNear(' + i + ')">填入全名</button></div>';
+    }).join('');
+    var head;
+    if(res.cn){
+      head = '<div class="cat other">无法判定 / Not enough to match</div>' +
+        '<div class="rate-meta" style="line-height:1.9;font-size:15px">「<b>' + escapeHtml(res.raw) + '</b>」' +
+        '是通用词（城市 / 行业词）或无法识别为具体公司，<b>不给税率结论</b>。</div>' +
+        '<div class="note">请补充<b>品牌名</b>（如“兴发”“博路德”“中盈建科”“翼鹏”）或完整公司名，也可直接输入 CCID。</div>';
+    } else {
+      head = '<div class="cat other">无法判定 / Not enough to match</div>' +
+        '<div class="rate-meta" style="line-height:1.9;font-size:15px">' +
+        '输入「<b>' + escapeHtml(res.raw) + '</b>」可判定字符不足（' + (res.got || 0) + ' 个），' +
+        '未达 <b>' + (res.need || MIN_SPAN) + ' 个字符</b>的判定门槛，因此<b>不给税率结论</b>。</div>' +
+        '<div class="note">少于 ' + (res.need || MIN_SPAN) + ' 个字符很容易撞上别家公司（例如输入 “ss” 会命中 Guangdong Seamle<b>ss</b> Home Co），' +
+        '所以系统只做提示、不下结论。请补到完整公司名，或改用 CCID。</div>';
+    }
+    return '<h2>查询结果 / Result</h2>' + head +
+      (res.note && !res.cn ? '<div class="note">' + escapeHtml(res.note) + '</div>' : '') +
+      (nearRows ? '<div style="margin-top:14px"><b style="font-size:12.5px;color:var(--ink-soft);letter-spacing:.6px">可能需要的是（未确认）：</b>' + nearRows + '</div>' : '');
+  }
+
+  function noneCard(res){
+    var nearRows = (res.near || []).map(function(h, i){
+      return '<div class="cand"><span>' + escapeHtml(h.e.name) + ' <span class="mono">' + escapeHtml(h.e.ccid || '') + '</span></span>' +
+        '<button class="ghost" onclick="fillNear(' + i + ')">填入全名</button></div>';
+    }).join('');
+    return '<h2>查询结果 / Result</h2>' +
+      '<div class="cat other">' + CAT_LABEL.other + '</div>' +
+      '<div class="rate-hero">' +
+        '<div class="rate-num high">73.3%</div>' +
+        '<div class="rate-meta">DSA 70.4% + CSA 2.9% · DSN <b>349</b><br>名单中无「' + escapeHtml(res.raw) + '」</div>' +
+      '</div>' +
+      (res.info ? '<div class="hint">' + escapeHtml(res.info) + '</div>' : '') +
+      '<div class="kv">' +
+        '<div><span>适用档位</span><b>All Other Exporters</b></div>' +
+        '<div><span>DSN</span><b>349</b></div>' +
+        '<div><span>DSA / CSA</span><b>70.4% / 2.9%</b></div>' +
+        '<div><span>税率</span><b>73.3%</b></div>' +
+      '</div>' +
+      '<div class="note warn"><b>为什么是 73.3%：</b>这家公司既不在 6 家列名出口商里，也不在 113 家残余出口商名单里，' +
+        '按规则统一适用 DSN 349「All Other Exporters」，DSA 70.4% + CSA 2.9% = 73.3%。</div>' +
+      '<div class="note"><b>先确认两件事：</b>① 发票卖方是不是这家（不是的话按发票方判）；' +
+        '② 货是「门窗成品/半成品」还是「型材」——后者走案号 667，兜底约 29.4%。</div>' +
+      (nearRows ? '<div style="margin-top:12px"><b style="font-size:12.5px;color:var(--ink-soft);letter-spacing:.6px">可能是（未确认）：</b>' + nearRows + '</div>' : '');
+  }
+
+  window.renderHits = function(res){
+    var el = document.getElementById('result');
+    el.style.display = 'block';
+    window.__near = res.near || [];
+    if(res.status === 'ok'){
+      window.__hits = res.hits;
+      el.innerHTML = okCard(res.hits[0]) + (res.hits.length > 1 ? '<div class="sim"><b style="font-size:12px;color:var(--ink-soft)">其他也命中的：</b><br>' +
+        res.hits.slice(1, 5).map(function(h, i){ return '<a onclick="pickIdx(' + (i+1) + ')">' + escapeHtml(h.e.name) + '</a>'; }).join('') + '</div>' : '');
+      setCalcRate(res.hits[0].e.rate);
+    } else if(res.status === 'ambiguous'){
+      window.__hits = res.hits;
+      el.innerHTML = ambCard(res);
+    } else if(res.status === 'insufficient'){
+      el.innerHTML = insuffCard(res);
+    } else if(res.status === 'none'){
+      setCalcRate(73.3);
+      el.innerHTML = noneCard(res);
+    }
+  };
+
+  window.pickIdx = function(i){
+    if(!window.__hits || !window.__hits[i]) return;
+    var el = document.getElementById('result');
+    el.innerHTML = okCard(window.__hits[i]);
+    setCalcRate(window.__hits[i].e.rate);
+    window.scrollTo({top:0, behavior:'smooth'});
+  };
+
+  window.fillNear = function(i){
+    if(!window.__near || !window.__near[i]) return;
+    document.getElementById('q').value = window.__near[i].e.name;
+    doSearch();
+    window.scrollTo({top:0, behavior:'smooth'});
+  };
+})();
 </script>
 </body>
 </html>
